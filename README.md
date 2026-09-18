@@ -3,10 +3,13 @@
 Authenticate by saml: verifies an assertion's signature and conditions against the `IdP` metadata. A technology of
 [xmip-core-authenticate](https://github.com/IlleNilsson/xmip-core-authenticate).
 
-Declared and not yet written; `architecture.toml` carries the maturity. When
-it is written it implements `Authenticator`, one mechanism at one gate (ADR-0050).
-What it may depend on is `repository-model.md` section 4 and ADR-0044: its
-capability, and no sibling.
+It verifies an enveloped XML signature inside the assertion — RSA-SHA256 over
+the exclusively canonicalized `SignedInfo`, SHA-256 over the assertion without
+its `Signature` — against the IdP certificate held as configuration, then
+`NotBefore`, `NotOnOrAfter`, the audience, the issuer and the subject. It covers
+a stated subset of exclusive canonicalization and refuses everything outside
+it by name: other algorithms, other transforms, a signature on the `Response`
+only, encrypted assertions, comments, processing instructions and CDATA.
 
 ## Toolchain
 
