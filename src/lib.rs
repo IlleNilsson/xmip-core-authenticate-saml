@@ -27,6 +27,12 @@
 //! whose canonical form this gate does not reproduce fails its digest and is
 //! refused, not passed — a signature over something read wrong would be worse
 //! than a refusal.
+//!
+//! A node that expects one account says so with
+//! [`Verifier::expecting_principal`]: the verified assertion's `NameID`, or
+//! its `upn` attribute where the `NameID` is not one, is read as the identify
+//! capability's `UserPrincipalName` and must be the same account, however
+//! either was spelled (ADR-0054).
 
 pub mod c14n;
 pub mod signature;
@@ -39,6 +45,7 @@ use base64::Engine;
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use context::Verified;
+use identify::UserPrincipalName;
 use rsa::RsaPublicKey;
 use rsa::pkcs8::DecodePublicKey;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -124,6 +131,7 @@ pub struct Verifier {
     certificate: IdpCertificate,
     issuer: Option<String>,
     audience: Option<String>,
+    principal: Option<UserPrincipalName>,
     leeway: i64,
     clock: Clock,
 }
@@ -137,6 +145,7 @@ impl Verifier {
             certificate,
             issuer: None,
             audience: None,
+            principal: None,
             leeway: 60,
             clock: Box::new(now),
         }
@@ -156,6 +165,14 @@ impl Verifier {
         self
     }
 
+    /// Refuse an assertion that does not name this account, in its `NameID`
+    /// or else in its `upn` attribute. Any spelling of the account meets it.
+    #[must_use]
+    pub fn expecting_principal(mut self, principal: UserPrincipalName) -> Self {
+        self.principal = Some(principal);
+        self
+    }
+
     /// How far a clock may be off before the conditions bite.
     #[must_use]
     pub const fn with_leeway(mut self, seconds: i64) -> Self {
@@ -168,6 +185,34 @@ impl Verifier {
     pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
         self.clock = Box::new(clock);
         self
+    }
+
+    /// Where an account is expected, the assertion names it.
+    fn check_principal(&self, assertion: &Element) -> Result<(), AuthenticateError> {
+        let Some(expected) = &self.principal else {
+            return Ok(());
+        };
+        let name_id = assertion.find("Subject").and_then(|s| s.find("NameID"));
+        let attribute = assertion.find("AttributeStatement").and_then(|statement| {
+            statement
+                .elements()
+                .find(|element| {
+                    let name = element.attribute("Name").unwrap_or_default();
+                    element.local() == "Attribute" && (name == "upn" || name.ends_with("/upn"))
+                })
+                .and_then(|element| element.find("AttributeValue"))
+        });
+        let read = |element: &Element| UserPrincipalName::parse(&element.text());
+        match name_id.and_then(read).or_else(|| attribute.and_then(read)) {
+            Some(named) if named.is(expected) => Ok(()),
+            Some(named) => Err(AuthenticateError::new(format!(
+                "the assertion names '{named}' and this node expects '{expected}'"
+            ))),
+            None => Err(AuthenticateError::new(format!(
+                "the assertion carries no user principal name, as its NameID or as a upn \
+                 attribute, and this node expects '{expected}'"
+            ))),
+        }
     }
 
     fn check_conditions(
@@ -269,6 +314,7 @@ impl Authenticator for Verifier {
             .find("Assertion")
             .ok_or_else(|| AuthenticateError::new("the document carries no Assertion"))?;
         self.check_conditions(assertion, &presented.value)?;
+        self.check_principal(assertion)?;
 
         Ok(Verified::Proven)
     }
@@ -363,6 +409,62 @@ mod tests {
         let verified = verifier(&private).verify(&presented(&xml)).expect("proven");
 
         assert_eq!(verified, Verified::Proven);
+    }
+
+    const UPN: &str = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn";
+
+    /// An assertion for `subject` within its window, its `upn` attribute
+    /// naming `upn` where one is given.
+    fn naming(private: &RsaPrivateKey, subject: &str, upn: Option<&str>) -> Presented {
+        let mut body = body(subject, "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z");
+        if let Some(upn) = upn {
+            body.push_str(&format!(
+                concat!(
+                    r#"<saml:AttributeStatement><saml:Attribute Name="{}">"#,
+                    r#"<saml:AttributeValue>{}</saml:AttributeValue>"#,
+                    r#"</saml:Attribute></saml:AttributeStatement>"#
+                ),
+                UPN, upn
+            ));
+        }
+        let xml = signed_assertion(private, "_a1", &body);
+        Presented::passed(mechanism::saml(), subject)
+            .with_proof(ASSERTION_PROOF, BASE64.encode(xml))
+    }
+
+    fn jane() -> UserPrincipalName {
+        UserPrincipalName::parse("jane@partnerx").expect("a name")
+    }
+
+    #[test]
+    fn a_name_id_or_a_upn_attribute_spelled_another_way_is_the_account_expected() {
+        let private = key();
+        let gate = verifier(&private).expecting_principal(jane());
+        let by_name_id = naming(&private, "PARTNERX\\Jane", None);
+        let by_attribute = naming(&private, "partner-x", Some("Jane@PartnerX"));
+
+        assert_eq!(gate.verify(&by_name_id).expect("proven"), Verified::Proven);
+        assert_eq!(
+            gate.verify(&by_attribute).expect("proven"),
+            Verified::Proven
+        );
+    }
+
+    #[test]
+    fn an_assertion_naming_another_account_is_refused_naming_both() {
+        let private = key();
+        let gate = verifier(&private).expecting_principal(jane());
+        let other = naming(&private, "mallory@partnerx", None);
+        let unnamed = naming(&private, "partner-x", None);
+
+        let refused = gate.verify(&other).expect_err("refused");
+        let missing = gate.verify(&unnamed).expect_err("refused");
+
+        assert_eq!(
+            refused.message,
+            "the assertion names 'mallory@partnerx' and this node expects 'jane@partnerx'"
+        );
+        assert!(missing.message.contains("carries no user principal name"));
     }
 
     #[test]
