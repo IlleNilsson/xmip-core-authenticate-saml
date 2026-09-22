@@ -41,25 +41,14 @@ pub mod xml;
 pub use xml::Element;
 
 use authenticate::{AuthenticateError, Authenticator, Presented};
-use base64::Engine;
-use base64::alphabet;
-use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use context::Verified;
 use identify::UserPrincipalName;
+use identify::saml::{self, ASSERTION_PROOF};
 use rsa::RsaPublicKey;
 use rsa::pkcs8::DecodePublicKey;
 use std::time::{SystemTime, UNIX_EPOCH};
 use x509_parser::prelude::{FromDer, X509Certificate};
 use xcore::{Mechanism, mechanism};
-
-/// The proof the identify sibling attaches the base64 assertion under.
-pub const ASSERTION_PROOF: &str = "saml.assertion";
-
-/// Standard base64, padded or not: identity providers differ.
-const BASE64: GeneralPurpose = GeneralPurpose::new(
-    &alphabet::STANDARD,
-    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
-);
 
 type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
 
@@ -110,6 +99,8 @@ impl IdpCertificate {
 /// One base64 block to DER: a PEM body between its markers, or the bytes as
 /// they are.
 fn to_der(bytes: &[u8], label: &str) -> Result<Vec<u8>, AuthenticateError> {
+    use base64::Engine as _;
+
     let text = core::str::from_utf8(bytes).unwrap_or_default();
     let begin = format!("-----BEGIN {label}-----");
     if let Some(start) = text.find(&begin) {
@@ -187,23 +178,28 @@ impl Verifier {
         self
     }
 
-    /// Where an account is expected, the assertion names it.
+    /// Where an account is expected, the assertion names it, by the rule both
+    /// gates read an assertion's principal by (`identify::saml`).
     fn check_principal(&self, assertion: &Element) -> Result<(), AuthenticateError> {
         let Some(expected) = &self.principal else {
             return Ok(());
         };
         let name_id = assertion.find("Subject").and_then(|s| s.find("NameID"));
-        let attribute = assertion.find("AttributeStatement").and_then(|statement| {
+        let upn = assertion.find("AttributeStatement").and_then(|statement| {
             statement
                 .elements()
                 .find(|element| {
-                    let name = element.attribute("Name").unwrap_or_default();
-                    element.local() == "Attribute" && (name == "upn" || name.ends_with("/upn"))
+                    element.local() == "Attribute"
+                        && saml::is_upn_attribute(element.attribute("Name").unwrap_or_default())
                 })
                 .and_then(|element| element.find("AttributeValue"))
         });
-        let read = |element: &Element| UserPrincipalName::parse(&element.text());
-        match name_id.and_then(read).or_else(|| attribute.and_then(read)) {
+        let named = saml::user_principal(
+            &name_id.map(Element::text).unwrap_or_default(),
+            name_id.and_then(|element| element.attribute("Format")),
+            upn.map(Element::text).as_deref(),
+        );
+        match named {
             Some(named) if named.is(expected) => Ok(()),
             Some(named) => Err(AuthenticateError::new(format!(
                 "the assertion names '{named}' and this node expects '{expected}'"
@@ -297,9 +293,7 @@ impl Authenticator for Verifier {
         let encoded = presented.proof(ASSERTION_PROOF).ok_or_else(|| {
             AuthenticateError::new(format!("no {ASSERTION_PROOF} proof was presented"))
         })?;
-        let bytes = BASE64
-            .decode(encoded.split_whitespace().collect::<String>())
-            .map_err(|_| AuthenticateError::new("the SAML assertion proof is not base64"))?;
+        let bytes = saml::decode(encoded)?;
         let xml = String::from_utf8(bytes)
             .map_err(|_| AuthenticateError::new("the SAML assertion is not UTF-8 XML"))?;
         if xml.contains("EncryptedAssertion") {
@@ -357,6 +351,8 @@ fn instant(text: &str) -> Result<i64, AuthenticateError> {
 mod tests {
     use super::*;
     use crate::signature::tests::signed_assertion;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use rsa::RsaPrivateKey;
 
     const NOW: i64 = 1_800_000_000; // 2027-01-15T08:00:00Z.
@@ -394,7 +390,7 @@ mod tests {
 
     fn presented(assertion: &str) -> Presented {
         Presented::passed(mechanism::saml(), "partner-x")
-            .with_proof(ASSERTION_PROOF, BASE64.encode(assertion))
+            .with_proof(ASSERTION_PROOF, STANDARD.encode(assertion))
     }
 
     #[test]
@@ -429,7 +425,7 @@ mod tests {
         }
         let xml = signed_assertion(private, "_a1", &body);
         Presented::passed(mechanism::saml(), subject)
-            .with_proof(ASSERTION_PROOF, BASE64.encode(xml))
+            .with_proof(ASSERTION_PROOF, STANDARD.encode(xml))
     }
 
     fn jane() -> UserPrincipalName {
@@ -542,7 +538,7 @@ mod tests {
     fn an_encrypted_assertion_is_refused_rather_than_passed() {
         let claim = Presented::passed(mechanism::saml(), "partner-x").with_proof(
             ASSERTION_PROOF,
-            BASE64.encode("<samlp:Response><EncryptedAssertion/></samlp:Response>"),
+            STANDARD.encode("<samlp:Response><EncryptedAssertion/></samlp:Response>"),
         );
 
         let failure = verifier(&key()).verify(&claim).expect_err("refused");

@@ -231,7 +231,7 @@ impl Reader<'_> {
                 children.push(Node::Element(self.element()?));
             } else if let Some(at) = self.rest.find('<') {
                 let (text, rest) = self.rest.split_at(at);
-                children.push(Node::Text(unescape(text)?));
+                children.push(Node::Text(codec::xml::unescape(text)?));
                 self.rest = rest;
             } else {
                 return Err(AuthenticateError::new("an XML element is not closed"));
@@ -265,7 +265,7 @@ impl Reader<'_> {
                 .rest
                 .find(quote)
                 .ok_or_else(|| AuthenticateError::new("an XML attribute value is not closed"))?;
-            let value = unescape(&self.rest[..end])?;
+            let value = codec::xml::unescape(&self.rest[..end])?;
             self.rest = &self.rest[end + 1..];
 
             if name == "xmlns" {
@@ -295,54 +295,6 @@ impl Reader<'_> {
         }
         Ok(name.to_string())
     }
-}
-
-/// Unescape the five predefined entities and numeric character references.
-fn unescape(text: &str) -> Result<String, AuthenticateError> {
-    if !text.contains('&') {
-        return Ok(text.to_string());
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find('&') {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + 1..];
-        let end = after
-            .find(';')
-            .ok_or_else(|| AuthenticateError::new("an XML entity is not terminated"))?;
-        let entity = &after[..end];
-        let character = match entity {
-            "lt" => '<',
-            "gt" => '>',
-            "amp" => '&',
-            "quot" => '"',
-            "apos" => '\'',
-            hex if hex.starts_with("#x") || hex.starts_with("#X") => {
-                u32::from_str_radix(&hex[2..], 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .ok_or_else(|| {
-                        AuthenticateError::new("an XML character reference is not a character")
-                    })?
-            }
-            decimal if decimal.starts_with('#') => decimal[1..]
-                .parse::<u32>()
-                .ok()
-                .and_then(char::from_u32)
-                .ok_or_else(|| {
-                    AuthenticateError::new("an XML character reference is not a character")
-                })?,
-            other => {
-                return Err(AuthenticateError::new(format!(
-                    "the XML holds the entity '&{other};', which this reader does not define"
-                )));
-            }
-        };
-        out.push(character);
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
 }
 
 #[cfg(test)]
