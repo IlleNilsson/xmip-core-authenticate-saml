@@ -354,6 +354,7 @@ mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use rsa::RsaPrivateKey;
+    use std::fmt::Write as _;
 
     const NOW: i64 = 1_800_000_000; // 2027-01-15T08:00:00Z.
     const ISSUER: &str = "https://idp.example";
@@ -414,14 +415,15 @@ mod tests {
     fn naming(private: &RsaPrivateKey, subject: &str, upn: Option<&str>) -> Presented {
         let mut body = body(subject, "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z");
         if let Some(upn) = upn {
-            body.push_str(&format!(
+            let _ = write!(
+                body,
                 concat!(
                     r#"<saml:AttributeStatement><saml:Attribute Name="{}">"#,
                     r#"<saml:AttributeValue>{}</saml:AttributeValue>"#,
                     r#"</saml:Attribute></saml:AttributeStatement>"#
                 ),
                 UPN, upn
-            ));
+            );
         }
         let xml = signed_assertion(private, "_a1", &body);
         Presented::passed(mechanism::saml(), subject)

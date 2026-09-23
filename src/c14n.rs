@@ -67,7 +67,7 @@ impl Element {
             out.push('"');
         }
         let mut attributes = self.attributes.clone();
-        attributes.sort_by(|(a, _), (b, _)| sort_key(a, &scope).cmp(&sort_key(b, &scope)));
+        attributes.sort_by_key(|(name, _)| sort_key(name, &scope));
         for (name, value) in &attributes {
             out.push(' ');
             out.push_str(name);
