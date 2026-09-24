@@ -29,14 +29,14 @@ authenticate = { package = "xmip-core-authenticate", git = "https://github.com/I
 # identify for the principal name types: no technology parses a principal
 # name itself (ADR-0054).
 identify = { package = "xmip-core-identify", git = "https://github.com/IlleNilsson/xmip-core-identify", branch = "main" }
-# XML character data, unescaped as every reader in the estate does.
+# XML character data, unescaped as every reader in the estate does, and the
+# civil calendar a dateTime is read into.
 codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
 context = { package = "xmip-core-context", git = "https://github.com/IlleNilsson/xmip-core-context", branch = "main" }
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
-# The assertion arrives as standard base64; the signature is RSA-SHA256 and
+# The assertion arrives as base 64 (codec); the signature is RSA-SHA256 and
 # the digest SHA-256; x509-parser reads the IdP certificate's public key and
 # nothing else (no chain is verified here).
-base64 = "0.22"
 rsa = { version = "0.9", features = ["sha2"] }
 x509-parser = "0.16"
 

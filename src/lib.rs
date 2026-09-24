@@ -40,27 +40,17 @@ pub mod xml;
 
 pub use xml::Element;
 
+use authenticate::clock::{Clock, Window};
 use authenticate::{AuthenticateError, Authenticator, Presented};
+use codec::civil::CivilTime;
 use context::Verified;
 use identify::UserPrincipalName;
-use identify::saml::{self, ASSERTION_PROOF};
+use identify::evidence::{self, SAML_ASSERTION};
+use identify::saml;
 use rsa::RsaPublicKey;
 use rsa::pkcs8::DecodePublicKey;
-use std::time::{SystemTime, UNIX_EPOCH};
 use x509_parser::prelude::{FromDer, X509Certificate};
 use xcore::{Mechanism, mechanism};
-
-type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
-
-/// Seconds since the Unix epoch, now.
-#[must_use]
-pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-        })
-}
 
 /// The identity provider's RSA signing key, however it was configured.
 #[derive(Clone, Debug)]
@@ -99,8 +89,6 @@ impl IdpCertificate {
 /// One base64 block to DER: a PEM body between its markers, or the bytes as
 /// they are.
 fn to_der(bytes: &[u8], label: &str) -> Result<Vec<u8>, AuthenticateError> {
-    use base64::Engine as _;
-
     let text = core::str::from_utf8(bytes).unwrap_or_default();
     let begin = format!("-----BEGIN {label}-----");
     if let Some(start) = text.find(&begin) {
@@ -109,8 +97,7 @@ fn to_der(bytes: &[u8], label: &str) -> Result<Vec<u8>, AuthenticateError> {
             .find("-----END")
             .ok_or_else(|| AuthenticateError::new("the PEM certificate is not closed"))?;
         let base64: String = body[..end].split_whitespace().collect();
-        return base64::engine::general_purpose::STANDARD
-            .decode(base64)
+        return codec::base64::decode(&base64)
             .map_err(|_| AuthenticateError::new("the PEM certificate body is not base64"));
     }
     Ok(bytes.to_vec())
@@ -123,7 +110,6 @@ pub struct Verifier {
     issuer: Option<String>,
     audience: Option<String>,
     principal: Option<UserPrincipalName>,
-    leeway: i64,
     clock: Clock,
 }
 
@@ -137,8 +123,7 @@ impl Verifier {
             issuer: None,
             audience: None,
             principal: None,
-            leeway: 60,
-            clock: Box::new(now),
+            clock: Clock::system(60),
         }
     }
 
@@ -166,15 +151,15 @@ impl Verifier {
 
     /// How far a clock may be off before the conditions bite.
     #[must_use]
-    pub const fn with_leeway(mut self, seconds: i64) -> Self {
-        self.leeway = seconds;
+    pub fn with_leeway(mut self, seconds: i64) -> Self {
+        self.clock = self.clock.forgiving(seconds);
         self
     }
 
     /// Where the time comes from; the tests pin it.
     #[must_use]
     pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
-        self.clock = Box::new(clock);
+        self.clock = self.clock.reading(clock);
         self
     }
 
@@ -240,24 +225,11 @@ impl Verifier {
             ));
         }
 
-        let now = (self.clock)();
         if let Some(conditions) = assertion.find("Conditions") {
-            if let Some(not_before) = conditions.attribute("NotBefore") {
-                let at = instant(not_before)?;
-                if now.saturating_add(self.leeway) < at {
-                    return Err(AuthenticateError::new(format!(
-                        "the assertion is not valid before {not_before} and it is now {now}"
-                    )));
-                }
-            }
-            if let Some(not_after) = conditions.attribute("NotOnOrAfter") {
-                let at = instant(not_after)?;
-                if now.saturating_sub(self.leeway) >= at {
-                    return Err(AuthenticateError::new(format!(
-                        "the assertion is not valid on or after {not_after} and it is now {now}"
-                    )));
-                }
-            }
+            let at = |name: &str| conditions.attribute(name).map(instant).transpose();
+            self.clock
+                .admits(Window::between(at("NotBefore")?, at("NotOnOrAfter")?))
+                .map_err(|outside| AuthenticateError::new(format!("the assertion {outside}")))?;
             if let Some(audience) = &self.audience {
                 let named = conditions
                     .find("Audience")
@@ -290,8 +262,8 @@ impl Authenticator for Verifier {
                 "'{name}' was presented and this authenticator verifies saml"
             )));
         }
-        let encoded = presented.proof(ASSERTION_PROOF).ok_or_else(|| {
-            AuthenticateError::new(format!("no {ASSERTION_PROOF} proof was presented"))
+        let encoded = presented.proof(evidence::SAML_ASSERTION).ok_or_else(|| {
+            AuthenticateError::new(format!("no {SAML_ASSERTION} proof was presented"))
         })?;
         let bytes = saml::decode(encoded)?;
         let xml = String::from_utf8(bytes)
@@ -329,30 +301,23 @@ fn instant(text: &str) -> Result<i64, AuthenticateError> {
     let mut time = time.split(':');
     let next = |part: &mut std::str::Split<'_, char>| {
         part.next()
-            .and_then(|value| value.parse::<i64>().ok())
+            .and_then(|value| value.parse::<u32>().ok())
             .ok_or_else(bad)
     };
-    let (year, month, day) = (next(&mut date)?, next(&mut date)?, next(&mut date)?);
+    let year = date
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(bad)?;
+    let (month, day) = (next(&mut date)?, next(&mut date)?);
     let (hour, minute, second) = (next(&mut time)?, next(&mut time)?, next(&mut time)?);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
-        return Err(bad());
-    }
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year.rem_euclid(400);
-    let shifted = (month + 9) % 12;
-    let day_of_year = (153 * shifted + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    Ok(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    let moment = CivilTime::new(year, month, day, hour, minute, second).ok_or_else(bad)?;
+    Ok(moment.unix())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::signature::tests::signed_assertion;
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
     use rsa::RsaPrivateKey;
     use std::fmt::Write as _;
 
@@ -390,8 +355,10 @@ mod tests {
     }
 
     fn presented(assertion: &str) -> Presented {
-        Presented::passed(mechanism::saml(), "partner-x")
-            .with_proof(ASSERTION_PROOF, STANDARD.encode(assertion))
+        Presented::passed(mechanism::saml(), "partner-x").with_proof(
+            evidence::SAML_ASSERTION,
+            codec::base64::encode(assertion.as_bytes()),
+        )
     }
 
     #[test]
@@ -426,8 +393,10 @@ mod tests {
             );
         }
         let xml = signed_assertion(private, "_a1", &body);
-        Presented::passed(mechanism::saml(), subject)
-            .with_proof(ASSERTION_PROOF, STANDARD.encode(xml))
+        Presented::passed(mechanism::saml(), subject).with_proof(
+            evidence::SAML_ASSERTION,
+            codec::base64::encode(xml.as_bytes()),
+        )
     }
 
     fn jane() -> UserPrincipalName {
@@ -494,7 +463,7 @@ mod tests {
             .verify(&presented(&xml))
             .expect_err("refused");
 
-        assert!(failure.message.contains("not valid on or after"));
+        assert!(failure.message.contains("expired at"));
     }
 
     #[test]
@@ -539,8 +508,10 @@ mod tests {
     #[test]
     fn an_encrypted_assertion_is_refused_rather_than_passed() {
         let claim = Presented::passed(mechanism::saml(), "partner-x").with_proof(
-            ASSERTION_PROOF,
-            STANDARD.encode("<samlp:Response><EncryptedAssertion/></samlp:Response>"),
+            evidence::SAML_ASSERTION,
+            codec::base64::encode(
+                "<samlp:Response><EncryptedAssertion/></samlp:Response>".as_bytes(),
+            ),
         );
 
         let failure = verifier(&key()).verify(&claim).expect_err("refused");
