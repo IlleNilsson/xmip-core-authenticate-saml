@@ -41,9 +41,10 @@ pub mod xml;
 pub use xml::Element;
 
 use authenticate::clock::{Clock, Window};
-use authenticate::{AuthenticateError, Authenticator, Presented};
+use authenticate::{AuthenticateError, Authenticator};
 use codec::civil::CivilTime;
 use context::Verified;
+use identify::Presented;
 use identify::UserPrincipalName;
 use identify::evidence::{self, SAML_ASSERTION};
 use identify::saml;
