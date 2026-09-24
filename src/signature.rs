@@ -12,8 +12,6 @@
 
 use crate::xml::Element;
 use authenticate::AuthenticateError;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use rsa::RsaPublicKey;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::sha2::{Digest, Sha256};
@@ -153,8 +151,7 @@ fn check_digest(
         .find("DigestValue")
         .map(Element::text)
         .ok_or_else(|| AuthenticateError::new("the Reference carries no DigestValue"))?;
-    let claimed = STANDARD
-        .decode(claimed.trim())
+    let claimed = codec::base64::decode(claimed.trim())
         .map_err(|_| AuthenticateError::new("the DigestValue is not base64"))?;
     if digest.as_slice() != claimed.as_slice() {
         return Err(AuthenticateError::new(
@@ -170,8 +167,7 @@ fn decode(signature: &Element, local: &str) -> Result<Vec<u8>, AuthenticateError
         .find(local)
         .map(Element::text)
         .ok_or_else(|| AuthenticateError::new(format!("the Signature carries no {local}")))?;
-    STANDARD
-        .decode(text.split_whitespace().collect::<String>())
+    codec::base64::decode(&text.split_whitespace().collect::<String>())
         .map_err(|_| AuthenticateError::new(format!("the {local} is not base64")))
 }
 
@@ -232,7 +228,7 @@ pub(crate) mod tests {
         let without = Element::parse(&assertion("<ds:Signature></ds:Signature>")).expect("xml");
         let mut bare = without.clone();
         bare.remove_first(&|element| element.local() == "Signature");
-        let digest = STANDARD.encode(Sha256::digest(bare.canonical(&[]).as_bytes()));
+        let digest = codec::base64::encode(&Sha256::digest(bare.canonical(&[]).as_bytes()));
 
         let signed_info = signed_info(id, &digest);
         // Canonical SignedInfo, in scope: saml and ds from the Assertion.
@@ -252,7 +248,7 @@ pub(crate) mod tests {
         .expect("xml");
         let canonical = element.find("SignedInfo").expect("si").canonical(&scope);
         let signer = SigningKey::<Sha256>::new(key.clone());
-        let value = STANDARD.encode(signer.sign(canonical.as_bytes()).to_vec());
+        let value = codec::base64::encode(&signer.sign(canonical.as_bytes()).to_vec());
         let signature = format!(
             concat!(
                 r#"<ds:Signature>{signed_info}"#,
@@ -344,7 +340,7 @@ pub(crate) mod tests {
         certificate.extend(der(0x03, &signature));
         let certificate = der(0x30, &certificate);
 
-        let body = STANDARD.encode(certificate);
+        let body = codec::base64::encode(&certificate);
         let wrapped = body
             .as_bytes()
             .chunks(64)
