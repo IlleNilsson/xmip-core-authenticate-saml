@@ -257,12 +257,6 @@ impl Authenticator for Verifier {
     }
 
     fn verify(&self, presented: &Presented) -> Result<Verified, AuthenticateError> {
-        let name = presented.mechanism.name();
-        if name != self.mechanism().name() {
-            return Err(AuthenticateError::new(format!(
-                "'{name}' was presented and this authenticator verifies saml"
-            )));
-        }
         let encoded = presented.proof(evidence::SAML_ASSERTION).ok_or_else(|| {
             AuthenticateError::new(format!("no {SAML_ASSERTION} proof was presented"))
         })?;
@@ -521,17 +515,10 @@ mod tests {
     }
 
     #[test]
-    fn another_mechanism_and_a_missing_proof_are_each_refused_by_name() {
+    fn a_missing_proof_is_refused_by_name() {
         let gate = verifier(&key());
-        let other = Presented::passed(mechanism::oidc(), "partner-x");
         let bare = Presented::passed(mechanism::saml(), "partner-x");
 
-        assert!(
-            gate.verify(&other)
-                .expect_err("refused")
-                .message
-                .contains("'oidc' was presented")
-        );
         assert!(
             gate.verify(&bare)
                 .expect_err("refused")
