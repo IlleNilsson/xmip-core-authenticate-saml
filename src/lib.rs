@@ -350,7 +350,7 @@ mod tests {
     }
 
     fn presented(assertion: &str) -> Presented {
-        Presented::passed(mechanism::saml(), "partner-x").with_proof(
+        Presented::passed(mechanism::saml(), "party-x").with_proof(
             evidence::SAML_ASSERTION,
             codec::base64::encode(assertion.as_bytes()),
         )
@@ -362,7 +362,7 @@ mod tests {
         let xml = signed_assertion(
             &private,
             "_a1",
-            &body("partner-x", "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z"),
+            &body("party-x", "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z"),
         );
 
         let verified = verifier(&private).verify(&presented(&xml)).expect("proven");
@@ -395,15 +395,15 @@ mod tests {
     }
 
     fn jane() -> UserPrincipalName {
-        UserPrincipalName::parse("jane@partnerx").expect("a name")
+        UserPrincipalName::parse("jane@partyx").expect("a name")
     }
 
     #[test]
     fn a_name_id_or_a_upn_attribute_spelled_another_way_is_the_account_expected() {
         let private = key();
         let gate = verifier(&private).expecting_principal(jane());
-        let by_name_id = naming(&private, "PARTNERX\\Jane", None);
-        let by_attribute = naming(&private, "partner-x", Some("Jane@PartnerX"));
+        let by_name_id = naming(&private, "PARTYX\\Jane", None);
+        let by_attribute = naming(&private, "party-x", Some("Jane@PartyX"));
 
         assert_eq!(gate.verify(&by_name_id).expect("proven"), Verified::Proven);
         assert_eq!(
@@ -416,15 +416,15 @@ mod tests {
     fn an_assertion_naming_another_account_is_refused_naming_both() {
         let private = key();
         let gate = verifier(&private).expecting_principal(jane());
-        let other = naming(&private, "mallory@partnerx", None);
-        let unnamed = naming(&private, "partner-x", None);
+        let other = naming(&private, "mallory@partyx", None);
+        let unnamed = naming(&private, "party-x", None);
 
         let refused = gate.verify(&other).expect_err("refused");
         let missing = gate.verify(&unnamed).expect_err("refused");
 
         assert_eq!(
             refused.message,
-            "the assertion names 'mallory@partnerx' and this node expects 'jane@partnerx'"
+            "the assertion names 'mallory@partyx' and this node expects 'jane@partyx'"
         );
         assert!(missing.message.contains("carries no user principal name"));
     }
@@ -435,7 +435,7 @@ mod tests {
         let xml = signed_assertion(
             &signer,
             "_a1",
-            &body("partner-x", "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z"),
+            &body("party-x", "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z"),
         );
 
         let failure = verifier(&key())
@@ -451,7 +451,7 @@ mod tests {
         let xml = signed_assertion(
             &private,
             "_a1",
-            &body("partner-x", "2027-01-15T05:00:00Z", "2027-01-15T06:00:00Z"),
+            &body("party-x", "2027-01-15T05:00:00Z", "2027-01-15T06:00:00Z"),
         );
 
         let failure = verifier(&private)
@@ -467,7 +467,7 @@ mod tests {
         let assertion = signed_assertion(
             &private,
             "_a1",
-            &body("partner-x", "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z"),
+            &body("party-x", "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z"),
         )
         .replace(AUDIENCE, "https://someone.else/acs");
 
@@ -502,7 +502,7 @@ mod tests {
 
     #[test]
     fn an_encrypted_assertion_is_refused_rather_than_passed() {
-        let claim = Presented::passed(mechanism::saml(), "partner-x").with_proof(
+        let claim = Presented::passed(mechanism::saml(), "party-x").with_proof(
             evidence::SAML_ASSERTION,
             codec::base64::encode(
                 "<samlp:Response><EncryptedAssertion/></samlp:Response>".as_bytes(),
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn a_missing_proof_is_refused_by_name() {
         let gate = verifier(&key());
-        let bare = Presented::passed(mechanism::saml(), "partner-x");
+        let bare = Presented::passed(mechanism::saml(), "party-x");
 
         assert!(
             gate.verify(&bare)
