@@ -20,7 +20,7 @@
 //! RSA-SHA256 signature over the canonical `SignedInfo`, and the subset of
 //! exclusive canonicalization [`xml`] documents. Everything else is refused
 //! by name and never passed: other signature or digest algorithms, other
-//! canonicalizations, extra or missing transforms, a detached or enveloping
+//! canonicalization methods, extra or missing transforms, a detached or enveloping
 //! signature, more than one reference, `KeyInfo`-selected keys, encrypted
 //! assertions, CDATA, comments and processing instructions. Only an RSA
 //! certificate is read; an EC or other `IdP` key is refused. An assertion
