@@ -38,10 +38,11 @@ xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core
 # the digest SHA-256; x509-parser reads the IdP certificate's public key and
 # nothing else (no chain is verified here).
 rsa = { version = "0.9", features = ["sha2"] }
-x509-parser = "0.16"
+x509-parser = "0.18"
 
 [dev-dependencies]
-# The tests mint an IdP key.
+# The tests mint an IdP key. rand 0.8, not the newest: rsa 0.9, the newest
+# release, draws from rand_core 0.6, the generation rand 0.8 is on.
 rand = "0.8"
 
 [lints.rust]
