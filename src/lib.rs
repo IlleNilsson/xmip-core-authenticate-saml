@@ -7,12 +7,22 @@
 //! claim, with the assertion itself — the posted `SAMLResponse` or the bare
 //! element, base64 — riding as the `saml.assertion` proof. This gate opens
 //! it: it checks the enveloped XML signature against the identity provider's
-//! certificate held as configuration (see [`signature`]), and then the
-//! assertion's conditions — `NotBefore` and `NotOnOrAfter` with the
-//! configured leeway, the `AudienceRestriction` naming this node, the
-//! `Issuer` being the expected provider, and the subject being the value that
-//! was claimed. Offline throughout (ADR-0045): the certificate is
-//! configuration, and no metadata is fetched.
+//! certificate held as configuration (see [`signature`]), and then what the
+//! signed assertion says, read from its own children and never by a search
+//! that could reach into the unsigned `Signature`: the `Issuer` is the
+//! expected provider, the subject's `NameID` is the value that was claimed,
+//! `Conditions` are there with a `NotOnOrAfter` (and `NotBefore` where
+//! given) the clock is inside with the configured leeway, every
+//! `AudienceRestriction` names this node, and the `Subject` carries a bearer
+//! `SubjectConfirmation` whose data carries a `NotOnOrAfter` that has not
+//! passed. Each of those is required. The issuer, audience and expiry checks
+//! are the capability's (`authenticate::claims`), the ones `jwt`, `oidc` and
+//! `oauth2` make too. An assertion that proves is spent by its `ID` and
+//! refused if presented again before it expires (SAML Core 2.5.1.5). The
+//! parser caps how deep elements nest before anything is verified. Offline
+//! throughout (ADR-0045): the certificate is configuration, and no metadata
+//! is fetched; the `Recipient` and `InResponseTo` of the confirmation are
+//! not checked.
 //!
 //! **What of XML-DSig is covered, precisely.** One enveloped `Signature` in
 //! the `Assertion`, one `Reference` to the assertion by its `ID`, the
@@ -40,7 +50,9 @@ pub mod xml;
 
 pub use xml::Element;
 
-use authenticate::clock::{Clock, Window};
+use authenticate::claims::{self, Expected};
+use authenticate::clock::Clock;
+use authenticate::replay::Replay;
 use authenticate::{AuthenticateError, Authenticator};
 use codec::civil::CivilTime;
 use context::Verified;
@@ -104,42 +116,33 @@ fn to_der(bytes: &[u8], label: &str) -> Result<Vec<u8>, AuthenticateError> {
     Ok(bytes.to_vec())
 }
 
+/// The bearer confirmation method (SAML Profiles 3.3), the one a browser
+/// posting an assertion makes.
+pub const BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
+
 /// The saml authenticator: the `IdP` certificate, the issuer and audience it
-/// expects, and how far a clock may be off.
+/// expects, how far a clock may be off, and the assertions already spent.
 pub struct Verifier {
     certificate: IdpCertificate,
-    issuer: Option<String>,
-    audience: Option<String>,
+    expected: Expected,
     principal: Option<UserPrincipalName>,
     clock: Clock,
+    spent: Replay,
 }
 
 impl Verifier {
-    /// Verifies against this certificate, expecting no issuer or audience,
-    /// with sixty seconds of leeway and the system clock.
+    /// Verifies against this certificate assertions from the issuer and for
+    /// the audience `expected` names, with sixty seconds of leeway and the
+    /// system clock.
     #[must_use]
-    pub fn new(certificate: IdpCertificate) -> Self {
+    pub fn new(certificate: IdpCertificate, expected: Expected) -> Self {
         Self {
             certificate,
-            issuer: None,
-            audience: None,
+            expected,
             principal: None,
             clock: Clock::system(60),
+            spent: Replay::default(),
         }
-    }
-
-    /// Refuse an assertion whose `Issuer` is not this.
-    #[must_use]
-    pub fn expecting_issuer(mut self, issuer: impl Into<String>) -> Self {
-        self.issuer = Some(issuer.into());
-        self
-    }
-
-    /// Refuse an assertion whose audience does not name this.
-    #[must_use]
-    pub fn expecting_audience(mut self, audience: impl Into<String>) -> Self {
-        self.audience = Some(audience.into());
-        self
     }
 
     /// Refuse an assertion that does not name this account, in its `NameID`
@@ -170,16 +173,12 @@ impl Verifier {
         let Some(expected) = &self.principal else {
             return Ok(());
         };
-        let name_id = assertion.find("Subject").and_then(|s| s.find("NameID"));
-        let upn = assertion.find("AttributeStatement").and_then(|statement| {
-            statement
-                .elements()
-                .find(|element| {
-                    element.local() == "Attribute"
-                        && saml::is_upn_attribute(element.attribute("Name").unwrap_or_default())
-                })
-                .and_then(|element| element.find("AttributeValue"))
-        });
+        let name_id = assertion.at(&["Subject", "NameID"]);
+        let upn = assertion
+            .children_named("AttributeStatement")
+            .flat_map(|statement| statement.children_named("Attribute"))
+            .find(|element| saml::is_upn_attribute(element.attribute("Name").unwrap_or_default()))
+            .and_then(|element| element.child("AttributeValue"));
         let named = saml::user_principal(
             &name_id.map(Element::text).unwrap_or_default(),
             name_id.and_then(|element| element.attribute("Format")),
@@ -197,27 +196,20 @@ impl Verifier {
         }
     }
 
+    /// The issuer, the subject, the `Conditions` and the bearer
+    /// confirmation, each read from the verified assertion's own children,
+    /// each required. Answers the second the assertion stops holding.
     fn check_conditions(
         &self,
         assertion: &Element,
         subject: &str,
-    ) -> Result<(), AuthenticateError> {
-        if let Some(issuer) = &self.issuer {
-            let named = assertion
-                .elements()
-                .find(|element| element.local() == "Issuer")
-                .map(Element::text)
-                .unwrap_or_default();
-            if named != *issuer {
-                return Err(AuthenticateError::new(format!(
-                    "the assertion's issuer is not '{issuer}'"
-                )));
-            }
-        }
+    ) -> Result<i64, AuthenticateError> {
+        let issuer = assertion.child("Issuer").map(Element::text);
+        self.expected
+            .issued("the assertion", issuer.as_deref().map(str::trim))?;
 
         let name_id = assertion
-            .find("Subject")
-            .and_then(|s| s.find("NameID"))
+            .at(&["Subject", "NameID"])
             .map(Element::text)
             .unwrap_or_default();
         if name_id != subject {
@@ -226,28 +218,66 @@ impl Verifier {
             ));
         }
 
-        if let Some(conditions) = assertion.find("Conditions") {
-            let at = |name: &str| conditions.attribute(name).map(instant).transpose();
-            self.clock
-                .admits(Window::between(at("NotBefore")?, at("NotOnOrAfter")?))
-                .map_err(|outside| AuthenticateError::new(format!("the assertion {outside}")))?;
-            if let Some(audience) = &self.audience {
-                let named = conditions
-                    .find("Audience")
-                    .map(Element::text)
-                    .unwrap_or_default();
-                if named != *audience {
-                    return Err(AuthenticateError::new(format!(
-                        "the assertion's audience does not name '{audience}'"
-                    )));
-                }
-            }
-        } else if self.audience.is_some() {
+        let conditions = assertion.child("Conditions").ok_or_else(|| {
+            AuthenticateError::new("the assertion carries no Conditions, and they are required")
+        })?;
+        let at = |name: &str| conditions.attribute(name).map(instant).transpose();
+        let until = at("NotOnOrAfter")?;
+        claims::current(
+            "the assertion",
+            &self.clock,
+            at("NotBefore")?,
+            ("NotOnOrAfter", until),
+        )?;
+        self.check_audiences(conditions)?;
+        self.check_bearer(assertion)?;
+        Ok(until.unwrap_or_default())
+    }
+
+    /// SAML Core 2.5.1.4: every `AudienceRestriction` must name this node,
+    /// and there must be one.
+    fn check_audiences(&self, conditions: &Element) -> Result<(), AuthenticateError> {
+        let mut restrictions = conditions.children_named("AudienceRestriction").peekable();
+        if restrictions.peek().is_none() {
             return Err(AuthenticateError::new(
-                "the assertion carries no Conditions and this node requires an audience",
+                "the assertion's Conditions carry no AudienceRestriction, and one is required",
             ));
         }
-        Ok(())
+        restrictions.try_for_each(|restriction| {
+            let named: Vec<String> = restriction
+                .children_named("Audience")
+                .map(|audience| audience.text().trim().to_string())
+                .collect();
+            self.expected
+                .addressed("the assertion", named.iter().map(String::as_str))
+        })
+    }
+
+    /// SAML Profiles 4.1.4.2: a bearer `SubjectConfirmation` whose data
+    /// carries a `NotOnOrAfter` the clock is inside.
+    fn check_bearer(&self, assertion: &Element) -> Result<(), AuthenticateError> {
+        let bearer = assertion
+            .child("Subject")
+            .into_iter()
+            .flat_map(|subject| subject.children_named("SubjectConfirmation"))
+            .find(|confirmation| confirmation.attribute("Method") == Some(BEARER))
+            .ok_or_else(|| {
+                AuthenticateError::new(
+                    "the assertion's Subject carries no bearer SubjectConfirmation, and one \
+                     is required",
+                )
+            })?;
+        let data = bearer.child("SubjectConfirmationData");
+        let until = data
+            .and_then(|data| data.attribute("NotOnOrAfter"))
+            .map(instant)
+            .transpose()?;
+        claims::current(
+            "the assertion's SubjectConfirmationData",
+            &self.clock,
+            None,
+            ("NotOnOrAfter", until),
+        )
     }
 }
 
@@ -270,13 +300,22 @@ impl Authenticator for Verifier {
         }
         let document = Element::parse(&xml)?;
 
-        signature::verify(&document, &self.certificate.key)?;
-        let assertion = document
-            .find("Assertion")
-            .ok_or_else(|| AuthenticateError::new("the document carries no Assertion"))?;
-        self.check_conditions(assertion, &presented.value)?;
+        let assertion = signature::verify(&document, &self.certificate.key)?;
+        let until = self.check_conditions(assertion, &presented.value)?;
         self.check_principal(assertion)?;
 
+        // Last, so an assertion that fails another check is not spent:
+        // SAML Core 2.5.1.5, kept until it would expire anyway.
+        let id = assertion.attribute("ID").unwrap_or_default();
+        self.spent
+            .spend(
+                id,
+                until.saturating_add(self.clock.leeway()),
+                self.clock.now(),
+            )
+            .map_err(|refused| {
+                AuthenticateError::new(format!("the assertion '{id}': {refused}"))
+            })?;
         Ok(Verified::Proven)
     }
 }
@@ -328,7 +367,10 @@ mod tests {
         format!(
             concat!(
                 r#"<saml:Issuer>{ISSUER}</saml:Issuer>"#,
-                r#"<saml:Subject><saml:NameID>{subject}</saml:NameID></saml:Subject>"#,
+                r#"<saml:Subject><saml:NameID>{subject}</saml:NameID>"#,
+                r#"<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">"#,
+                r#"<saml:SubjectConfirmationData NotOnOrAfter="{not_after}"/>"#,
+                r#"</saml:SubjectConfirmation></saml:Subject>"#,
                 r#"<saml:Conditions NotBefore="{not_before}" NotOnOrAfter="{not_after}">"#,
                 r#"<saml:AudienceRestriction><saml:Audience>{AUDIENCE}</saml:Audience>"#,
                 r#"</saml:AudienceRestriction></saml:Conditions>"#
@@ -343,10 +385,76 @@ mod tests {
 
     fn verifier(private: &RsaPrivateKey) -> Verifier {
         let certificate = IdpCertificate::from_public_key(RsaPublicKey::from(private));
-        Verifier::new(certificate)
-            .expecting_issuer(ISSUER)
-            .expecting_audience(AUDIENCE)
+        Verifier::new(certificate, Expected::new(ISSUER, AUDIENCE).expect("both"))
             .with_clock(|| NOW)
+    }
+
+    fn within_window(subject: &str) -> String {
+        body(subject, "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z")
+    }
+
+    #[test]
+    fn a_wrapped_assertion_naming_another_subject_in_its_signature_is_refused() {
+        // The assertion is genuinely the IdP's, for party-x; the Subject an
+        // attacker wrote into the unsigned Signature names admin.
+        let private = key();
+        let planted = concat!(
+            "<ds:Object><saml:Subject><saml:NameID>admin</saml:NameID>",
+            "</saml:Subject></ds:Object>"
+        );
+        let xml = crate::signature::tests::signed_with(
+            &private,
+            "_a1",
+            &within_window("party-x"),
+            planted,
+        );
+        let claim = Presented::passed(mechanism::saml(), "admin").with_proof(
+            evidence::SAML_ASSERTION,
+            codec::base64::encode(xml.as_bytes()),
+        );
+
+        let failure = verifier(&private).verify(&claim).expect_err("wrapped");
+
+        assert!(failure.message.contains("Signature holds"), "{failure}");
+    }
+
+    #[test]
+    fn an_assertion_presented_twice_is_refused_the_second_time() {
+        let private = key();
+        let gate = verifier(&private);
+        let xml = signed_assertion(&private, "_a1", &within_window("party-x"));
+
+        assert_eq!(
+            gate.verify(&presented(&xml)).expect("proven"),
+            Verified::Proven
+        );
+        let replay = gate.verify(&presented(&xml)).expect_err("a replay");
+
+        assert!(replay.message.contains("'_a1'"), "{replay}");
+        assert!(replay.message.contains("replay"), "{replay}");
+    }
+
+    #[test]
+    fn an_assertion_without_conditions_or_a_bearer_confirmation_is_refused() {
+        let private = key();
+        let bare = concat!(
+            "<saml:Issuer>https://idp.example</saml:Issuer>",
+            "<saml:Subject><saml:NameID>party-x</saml:NameID></saml:Subject>",
+        );
+        let unconfirmed = within_window("party-x").replace(
+            "urn:oasis:names:tc:SAML:2.0:cm:bearer",
+            "urn:oasis:names:tc:SAML:2.0:cm:sender-vouches",
+        );
+
+        let conditions = verifier(&private)
+            .verify(&presented(&signed_assertion(&private, "_a1", bare)))
+            .expect_err("no Conditions");
+        let bearer = verifier(&private)
+            .verify(&presented(&signed_assertion(&private, "_a2", &unconfirmed)))
+            .expect_err("no bearer");
+
+        assert!(conditions.message.contains("no Conditions"), "{conditions}");
+        assert!(bearer.message.contains("bearer"), "{bearer}");
     }
 
     fn presented(assertion: &str) -> Presented {
@@ -375,6 +483,8 @@ mod tests {
     /// An assertion for `subject` within its window, its `upn` attribute
     /// naming `upn` where one is given.
     fn naming(private: &RsaPrivateKey, subject: &str, upn: Option<&str>) -> Presented {
+        // An ID of its own: each assertion spends once.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
         let mut body = body(subject, "2027-01-15T07:00:00Z", "2027-01-15T09:00:00Z");
         if let Some(upn) = upn {
             let _ = write!(
@@ -387,7 +497,11 @@ mod tests {
                 UPN, upn
             );
         }
-        let xml = signed_assertion(private, "_a1", &body);
+        let id = format!(
+            "_n{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let xml = signed_assertion(private, &id, &body);
         Presented::passed(mechanism::saml(), subject).with_proof(
             evidence::SAML_ASSERTION,
             codec::base64::encode(xml.as_bytes()),

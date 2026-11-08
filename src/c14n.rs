@@ -147,7 +147,7 @@ mod tests {
             r##"</ds:SignedInfo></saml:Assertion>"##
         ))
         .expect("parsed");
-        let signed_info = element.find("SignedInfo").expect("signed info");
+        let signed_info = element.child("SignedInfo").expect("signed info");
 
         let canonical = signed_info.canonical(&[
             ("saml".to_string(), "urn:s".to_string()),

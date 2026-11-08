@@ -55,6 +55,7 @@ impl Element {
     pub fn parse(xml: &str) -> Result<Self, AuthenticateError> {
         let mut reader = Reader {
             rest: xml.trim_start_matches('\u{feff}'),
+            depth: 0,
         };
         reader.skip_prolog()?;
         let element = reader.element()?;
@@ -99,13 +100,35 @@ impl Element {
         })
     }
 
-    /// The first descendant with this local name, self included, depth first.
+    /// The first child element with this local name. A child and never a
+    /// deeper descendant: what a signed assertion says is read from where
+    /// the schema puts it, so nothing planted lower down — inside the
+    /// unsigned `Signature`, or an `Advice` — is read in its place.
     #[must_use]
-    pub fn find(&self, local: &str) -> Option<&Element> {
-        if self.local() == local {
-            return Some(self);
-        }
-        self.elements().find_map(|child| child.find(local))
+    pub fn child(&self, local: &str) -> Option<&Element> {
+        self.elements().find(|element| element.local() == local)
+    }
+
+    /// Every child element with this local name, in order.
+    pub fn children_named<'a>(&'a self, local: &'a str) -> impl Iterator<Item = &'a Element> {
+        self.elements()
+            .filter(move |element| element.local() == local)
+    }
+
+    /// The child elements along `path`, each a child of the one before:
+    /// `["Subject", "NameID"]`.
+    #[must_use]
+    pub fn at(&self, path: &[&str]) -> Option<&Element> {
+        path.iter()
+            .try_fold(self, |element, local| element.child(local))
+    }
+
+    /// Whether anything but whitespace stands between the child elements.
+    #[must_use]
+    pub fn has_text(&self) -> bool {
+        self.children
+            .iter()
+            .any(|child| matches!(child, Node::Text(text) if !text.trim().is_empty()))
     }
 
     /// The concatenated text directly inside this element.
@@ -120,26 +143,30 @@ impl Element {
             .collect()
     }
 
-    /// Remove the first descendant element for which `predicate` holds; the
-    /// enveloped-signature transform removes the `Signature`.
-    pub fn remove_first(&mut self, predicate: &impl Fn(&Element) -> bool) -> bool {
-        if let Some(index) = self
+    /// Remove the first child element for which `predicate` holds; the
+    /// enveloped-signature transform removes the assertion's own
+    /// `Signature`, which is its child.
+    pub fn remove_child(&mut self, predicate: &impl Fn(&Element) -> bool) -> bool {
+        let Some(index) = self
             .children
             .iter()
             .position(|child| matches!(child, Node::Element(element) if predicate(element)))
-        {
-            self.children.remove(index);
-            return true;
-        }
-        self.children.iter_mut().any(|child| match child {
-            Node::Element(element) => element.remove_first(predicate),
-            Node::Text(_) => false,
-        })
+        else {
+            return false;
+        };
+        self.children.remove(index);
+        true
     }
 }
 
+/// How deep elements may nest. An assertion is six deep at most; the cap
+/// stops a document built to exhaust the stack before any signature is
+/// checked.
+pub const DEEPEST: usize = 32;
+
 struct Reader<'a> {
     rest: &'a str,
+    depth: usize,
 }
 
 impl Reader<'_> {
@@ -198,7 +225,14 @@ impl Reader<'_> {
             .strip_prefix('>')
             .ok_or_else(|| AuthenticateError::new("an XML start tag is not closed"))?;
 
+        self.depth += 1;
+        if self.depth > DEEPEST {
+            return Err(AuthenticateError::new(format!(
+                "the XML nests deeper than {DEEPEST} elements, which no assertion does"
+            )));
+        }
         let children = self.children(&name)?;
+        self.depth -= 1;
         Ok(Element {
             name,
             namespaces,
@@ -312,7 +346,38 @@ mod tests {
         assert_eq!(element.local(), "Assertion");
         assert_eq!(element.prefix(), "saml");
         assert_eq!(element.attribute("ID"), Some("_1"));
-        assert_eq!(element.find("Issuer").expect("issuer").text(), "idp");
+        assert_eq!(element.child("Issuer").expect("issuer").text(), "idp");
+    }
+
+    #[test]
+    fn a_child_is_read_where_it_stands_and_never_from_deeper_down() {
+        let element = Element::parse(
+            "<A><Signature><Object><Subject>planted</Subject></Object></Signature>\
+             <Subject><NameID>who</NameID></Subject></A>",
+        )
+        .expect("parsed");
+
+        assert_eq!(
+            element.at(&["Subject", "NameID"]).expect("a name").text(),
+            "who"
+        );
+        assert_eq!(element.children_named("Subject").count(), 1);
+        assert!(element.at(&["Subject", "Absent"]).is_none());
+    }
+
+    #[test]
+    fn a_document_nested_past_the_cap_is_refused_before_anything_reads_it() {
+        let deep = format!(
+            "{}{}",
+            "<a>".repeat(DEEPEST + 1),
+            "</a>".repeat(DEEPEST + 1)
+        );
+        let held = format!("{}{}", "<a>".repeat(DEEPEST), "</a>".repeat(DEEPEST));
+
+        let failure = Element::parse(&deep).expect_err("too deep");
+
+        assert!(failure.message.contains("nests deeper"), "{failure}");
+        assert!(Element::parse(&held).is_ok());
     }
 
     #[test]
@@ -328,7 +393,7 @@ mod tests {
             Element::parse(r#"<A xmlns="u"><Signature>s</Signature><Subject>who</Subject></A>"#)
                 .expect("parsed");
 
-        let removed = element.remove_first(&|child| child.local() == "Signature");
+        let removed = element.remove_child(&|child| child.local() == "Signature");
 
         assert!(removed);
         assert_eq!(
