@@ -62,7 +62,7 @@ use identify::evidence::{self, SAML_ASSERTION};
 use identify::saml;
 use rsa::RsaPublicKey;
 use rsa::pkcs8::DecodePublicKey;
-use x509_parser::prelude::{FromDer, X509Certificate};
+use tls::certificate::Certificate;
 use xcore::{Mechanism, mechanism};
 
 /// The identity provider's RSA signing key, however it was configured.
@@ -79,11 +79,11 @@ impl IdpCertificate {
     ///
     /// Where the bytes are not an X.509 certificate, or its key is not RSA.
     pub fn from_certificate(certificate: &[u8]) -> Result<Self, AuthenticateError> {
-        let der = to_der(certificate, "CERTIFICATE")?;
-        let (_, parsed) = X509Certificate::from_der(&der).map_err(|_| {
+        let der = to_der(certificate)?;
+        let parsed = Certificate::read(&der).map_err(|_| {
             AuthenticateError::new("the IdP certificate is not an X.509 certificate")
         })?;
-        let key = RsaPublicKey::from_public_key_der(parsed.public_key().raw).map_err(|_| {
+        let key = RsaPublicKey::from_public_key_der(&parsed.public_key_info).map_err(|_| {
             AuthenticateError::new(
                 "the IdP certificate's key is not RSA, which is all this gate reads",
             )
@@ -99,21 +99,19 @@ impl IdpCertificate {
     }
 }
 
-/// One base64 block to DER: a PEM body between its markers, or the bytes as
-/// they are.
-fn to_der(bytes: &[u8], label: &str) -> Result<Vec<u8>, AuthenticateError> {
+/// The certificate's DER: its first `CERTIFICATE` block where the bytes
+/// are PEM (`codec::pem`, the estate's one reader), the bytes as they are
+/// otherwise.
+fn to_der(bytes: &[u8]) -> Result<Vec<u8>, AuthenticateError> {
     let text = core::str::from_utf8(bytes).unwrap_or_default();
-    let begin = format!("-----BEGIN {label}-----");
-    if let Some(start) = text.find(&begin) {
-        let body = &text[start + begin.len()..];
-        let end = body
-            .find("-----END")
-            .ok_or_else(|| AuthenticateError::new("the PEM certificate is not closed"))?;
-        let base64: String = body[..end].split_whitespace().collect();
-        return codec::base64::decode(&base64)
-            .map_err(|_| AuthenticateError::new("the PEM certificate body is not base64"));
+    if !text.contains("-----BEGIN ") {
+        return Ok(bytes.to_vec());
     }
-    Ok(bytes.to_vec())
+    codec::pem::decode("CERTIFICATE", text)
+        .map_err(|failure| AuthenticateError::new(format!("the PEM certificate: {failure}")))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AuthenticateError::new("the PEM holds no CERTIFICATE"))
 }
 
 /// The bearer confirmation method (SAML Profiles 3.3), the one a browser

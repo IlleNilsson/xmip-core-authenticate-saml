@@ -5,9 +5,10 @@
 //! `InclusiveNamespaces` prefix list, namespace declarations emitted where
 //! visibly used and not already rendered by an ancestor, attributes ordered
 //! by namespace then local name, text and attribute values escaped as the
-//! specification says. It does not implement the `xml:` attribute inheritance
-//! rule or attribute-value whitespace normalization; an assertion needing
-//! either does not verify, and the crate documentation says so.
+//! specification says, over values the estate's one XML reader normalized
+//! as XML 1.0 does. It does not implement the `xml:` attribute inheritance
+//! rule; an assertion needing it does not verify, and the crate
+//! documentation says so.
 
 use crate::xml::{Element, Node};
 

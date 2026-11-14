@@ -5,7 +5,9 @@ Authenticate by saml: verifies an assertion's signature and conditions against t
 
 It verifies an enveloped XML signature inside the assertion — RSA-SHA256 over
 the exclusively canonicalized `SignedInfo`, SHA-256 over the assertion without
-its `Signature` — against the IdP certificate held as configuration. The
+its `Signature` — against the IdP certificate held as configuration, its key
+read by the estate's one certificate reader (`tls::certificate`) and its PEM
+by `codec::pem` (ADR-0033, amendment 2026-11-13). The
 document is the assertion, or a `Response` with exactly one `Assertion`
 child; the `Signature` is the assertion's child and holds `SignedInfo`,
 `SignatureValue` and at most a bare `KeyInfo`, all in the XML-DSig

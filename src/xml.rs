@@ -1,27 +1,27 @@
-//! A small XML reader and the exclusive canonicalization a signed assertion
-//! needs, and nothing beyond it.
+//! A signed assertion as an element tree, read through the estate's one
+//! XML reader, and the exclusive canonicalization it needs.
 //!
-//! This parses the well-formed subset a SAML assertion is: elements,
-//! attributes, text and the five predefined entities, with the XML
-//! declaration and comments skipped. It refuses what it does not implement —
-//! CDATA sections, character references outside the predefined entities that
-//! are not decimal or hex, processing instructions inside the document, and
-//! DTDs — rather than mishandle them, because a signature over something read
-//! wrong is worse than a refusal.
+//! The text is read by `codec::xml::tree`, the reader every XML in the
+//! estate goes through: elements, attributes, the namespaces each element
+//! declares, and text with line ends and an attribute's white space made
+//! what XML 1.0 makes them and the five predefined entities and character
+//! references read. Comments are passed over, as exclusive canonicalization
+//! without comments does. CDATA sections, processing instructions and a
+//! document type declaration are refused rather than read, and so is
+//! nesting past [`DEEPEST`], because a signature over something read wrong
+//! is worse than a refusal. Until 2026-11-13 this file was a reader of its
+//! own.
 //!
 //! [`Element::canonical`] renders exclusive XML canonicalization (XML-EXC-C14N
 //! 1.0) for the common case: no comments, no `InclusiveNamespaces` prefix
 //! list, namespace declarations emitted where visibly used and not already
 //! rendered by an ancestor, attributes ordered by namespace then local name,
 //! text and attribute values escaped as the specification says. It does not
-//! implement the `xml:` attribute inheritance rule or attribute-value
-//! whitespace normalization; an assertion needing either does not verify, and
-//! [`crate`]'s documentation says so.
+//! implement the `xml:` attribute inheritance rule; an assertion needing it
+//! does not verify, and [`crate`]'s documentation says so.
 
 use authenticate::AuthenticateError;
-
-/// A list of name-value pairs: attributes, or namespace declarations.
-type Pairs = Vec<(String, String)>;
+use codec::xml::tree::{self, Document, Options};
 
 /// One element of the tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,7 +31,7 @@ pub struct Element {
     /// The `xmlns` and `xmlns:*` declarations on this element, prefix then
     /// URI; the default namespace is the empty prefix.
     pub namespaces: Vec<(String, String)>,
-    /// The other attributes, qualified name then unescaped value.
+    /// The other attributes, qualified name then value as read.
     pub attributes: Vec<(String, String)>,
     /// The element's children in order.
     pub children: Vec<Node>,
@@ -42,7 +42,7 @@ pub struct Element {
 pub enum Node {
     /// A nested element.
     Element(Element),
-    /// Character data, unescaped.
+    /// Character data, as read.
     Text(String),
 }
 
@@ -51,21 +51,43 @@ impl Element {
     ///
     /// # Errors
     ///
-    /// Where the text is not the well-formed subset this reads.
+    /// Where the text is not one well-formed document, or holds what this
+    /// gate refuses.
     pub fn parse(xml: &str) -> Result<Self, AuthenticateError> {
-        let mut reader = Reader {
-            rest: xml.trim_start_matches('\u{feff}'),
-            depth: 0,
+        let options = Options {
+            depth: DEEPEST,
+            cdata: false,
+            instructions: false,
         };
-        reader.skip_prolog()?;
-        let element = reader.element()?;
-        reader.skip_trivia()?;
-        if !reader.rest.trim().is_empty() {
-            return Err(AuthenticateError::new(
-                "the XML has content after its root element",
-            ));
+        let document = Document::parse_with(xml, &options)
+            .map_err(|refused| AuthenticateError::new(refused.to_string()))?;
+        Ok(Self::of(document.root_element()))
+    }
+
+    /// The element `node` is, and everything inside it but comments.
+    fn of(node: tree::Node<'_>) -> Self {
+        let pair = |(name, value): (&str, &str)| (name.to_string(), value.to_string());
+        Self {
+            name: node.name().to_string(),
+            namespaces: node.declarations().map(pair).collect(),
+            attributes: node
+                .attributes()
+                .map(|attribute| pair((attribute.name(), attribute.value())))
+                .collect(),
+            children: node
+                .children()
+                .filter_map(|child| {
+                    if child.is_element() {
+                        Some(Node::Element(Self::of(child)))
+                    } else {
+                        child
+                            .text()
+                            .filter(|_| child.is_text())
+                            .map(|text| Node::Text(text.to_string()))
+                    }
+                })
+                .collect(),
         }
-        Ok(element)
     }
 
     /// This element's prefix, `saml` in `saml:Assertion`, or the empty
@@ -164,173 +186,6 @@ impl Element {
 /// checked.
 pub const DEEPEST: usize = 32;
 
-struct Reader<'a> {
-    rest: &'a str,
-    depth: usize,
-}
-
-impl Reader<'_> {
-    fn skip_prolog(&mut self) -> Result<(), AuthenticateError> {
-        self.rest = self.rest.trim_start();
-        if self.rest.starts_with("<?xml") {
-            let end = self
-                .rest
-                .find("?>")
-                .ok_or_else(|| AuthenticateError::new("the XML declaration is not closed"))?;
-            self.rest = &self.rest[end + 2..];
-        }
-        self.skip_trivia()
-    }
-
-    /// Whitespace and comments between markup.
-    fn skip_trivia(&mut self) -> Result<(), AuthenticateError> {
-        loop {
-            self.rest = self.rest.trim_start();
-            if self.rest.starts_with("<!--") {
-                let end = self
-                    .rest
-                    .find("-->")
-                    .ok_or_else(|| AuthenticateError::new("an XML comment is not closed"))?;
-                self.rest = &self.rest[end + 3..];
-            } else if self.rest.starts_with("<!") || self.rest.starts_with("<?") {
-                return Err(AuthenticateError::new(
-                    "the XML holds a DTD or processing instruction, which this reader refuses",
-                ));
-            } else {
-                return Ok(());
-            }
-        }
-    }
-
-    fn element(&mut self) -> Result<Element, AuthenticateError> {
-        if !self.rest.starts_with('<') {
-            return Err(AuthenticateError::new("expected an XML element"));
-        }
-        self.rest = &self.rest[1..];
-        let name = self.take_name()?;
-        let (namespaces, attributes) = self.attributes()?;
-
-        self.rest = self.rest.trim_start();
-        if let Some(rest) = self.rest.strip_prefix("/>") {
-            self.rest = rest;
-            return Ok(Element {
-                name,
-                namespaces,
-                attributes,
-                children: Vec::new(),
-            });
-        }
-        self.rest = self
-            .rest
-            .strip_prefix('>')
-            .ok_or_else(|| AuthenticateError::new("an XML start tag is not closed"))?;
-
-        self.depth += 1;
-        if self.depth > DEEPEST {
-            return Err(AuthenticateError::new(format!(
-                "the XML nests deeper than {DEEPEST} elements, which no assertion does"
-            )));
-        }
-        let children = self.children(&name)?;
-        self.depth -= 1;
-        Ok(Element {
-            name,
-            namespaces,
-            attributes,
-            children,
-        })
-    }
-
-    fn children(&mut self, name: &str) -> Result<Vec<Node>, AuthenticateError> {
-        let mut children = Vec::new();
-        loop {
-            if self.rest.starts_with("<!--") {
-                self.skip_trivia()?;
-                continue;
-            }
-            let close = format!("</{name}");
-            if let Some(rest) = self.rest.strip_prefix(&close) {
-                let rest = rest.trim_start();
-                self.rest = rest
-                    .strip_prefix('>')
-                    .ok_or_else(|| AuthenticateError::new("an XML end tag is not closed"))?;
-                return Ok(children);
-            }
-            if self.rest.starts_with("<![CDATA[") {
-                return Err(AuthenticateError::new(
-                    "the XML holds a CDATA section, which this reader refuses",
-                ));
-            }
-            if self.rest.starts_with('<') {
-                children.push(Node::Element(self.element()?));
-            } else if let Some(at) = self.rest.find('<') {
-                let (text, rest) = self.rest.split_at(at);
-                children.push(Node::Text(codec::xml::unescape(text)?));
-                self.rest = rest;
-            } else {
-                return Err(AuthenticateError::new("an XML element is not closed"));
-            }
-        }
-    }
-
-    fn attributes(&mut self) -> Result<(Pairs, Pairs), AuthenticateError> {
-        let mut namespaces = Vec::new();
-        let mut attributes = Vec::new();
-        loop {
-            self.rest = self.rest.trim_start();
-            if self.rest.starts_with('>') || self.rest.starts_with("/>") {
-                return Ok((namespaces, attributes));
-            }
-            let name = self.take_name()?;
-            self.rest = self
-                .rest
-                .trim_start()
-                .strip_prefix('=')
-                .ok_or_else(|| AuthenticateError::new("an XML attribute has no value"))?
-                .trim_start();
-            let quote = self
-                .rest
-                .chars()
-                .next()
-                .filter(|character| *character == '"' || *character == '\'')
-                .ok_or_else(|| AuthenticateError::new("an XML attribute value is not quoted"))?;
-            self.rest = &self.rest[1..];
-            let end = self
-                .rest
-                .find(quote)
-                .ok_or_else(|| AuthenticateError::new("an XML attribute value is not closed"))?;
-            let value = codec::xml::unescape(&self.rest[..end])?;
-            self.rest = &self.rest[end + 1..];
-
-            if name == "xmlns" {
-                namespaces.push((String::new(), value));
-            } else if let Some(prefix) = name.strip_prefix("xmlns:") {
-                namespaces.push((prefix.to_string(), value));
-            } else {
-                attributes.push((name, value));
-            }
-        }
-    }
-
-    fn take_name(&mut self) -> Result<String, AuthenticateError> {
-        let end = self
-            .rest
-            .find(|character: char| {
-                character.is_whitespace()
-                    || character == '>'
-                    || character == '/'
-                    || character == '='
-            })
-            .ok_or_else(|| AuthenticateError::new("an XML name does not end"))?;
-        let (name, rest) = self.rest.split_at(end);
-        self.rest = rest;
-        if name.is_empty() {
-            return Err(AuthenticateError::new("an XML name is empty"));
-        }
-        Ok(name.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,10 +236,13 @@ mod tests {
     }
 
     #[test]
-    fn a_cdata_section_is_refused_rather_than_read_wrong() {
+    fn a_cdata_section_an_instruction_and_a_dtd_are_refused_rather_than_read_wrong() {
         let failure = Element::parse("<a><![CDATA[x]]></a>").expect_err("refused");
-
         assert!(failure.message.contains("CDATA"));
+        let failure = Element::parse("<a><?pi x?></a>").expect_err("refused");
+        assert!(failure.message.contains("processing instruction"));
+        let failure = Element::parse("<!DOCTYPE a><a/>").expect_err("refused");
+        assert!(failure.message.contains("DTD"));
     }
 
     #[test]
