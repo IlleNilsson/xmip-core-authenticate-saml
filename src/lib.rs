@@ -178,7 +178,7 @@ impl Verifier {
             .find(|element| saml::is_upn_attribute(element.attribute("Name").unwrap_or_default()))
             .and_then(|element| element.child("AttributeValue"));
         let named = saml::user_principal(
-            &name_id.map(Element::text).unwrap_or_default(),
+            &name_id.map_or_default(Element::text),
             name_id.and_then(|element| element.attribute("Format")),
             upn.map(Element::text).as_deref(),
         );
@@ -208,8 +208,7 @@ impl Verifier {
 
         let name_id = assertion
             .at(&["Subject", "NameID"])
-            .map(Element::text)
-            .unwrap_or_default();
+            .map_or_default(Element::text);
         if name_id != subject {
             return Err(AuthenticateError::new(
                 "the assertion's subject is not the claimed value",
