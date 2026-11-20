@@ -1,14 +1,3 @@
-# Its own workspace root, so this repository builds on its own.
-#
-# Every module repository carries this and the template did not, which stopped
-# mattering the moment the template stopped sitting beside the estate: nested at
-# template/rust, cargo walked up, found the root workspace and refused to build.
-#
-# It would have bitten a generated repository the same way. A template that does
-# not obey the estate's rules produces repositories that start out breaking
-# them — doc/governance/rust-style.md section 4.
-[workspace]
-
 [package]
 name = "xmip-core-authenticate-saml"
 version = "0.1.0"
@@ -66,6 +55,3 @@ missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 unwrap_used = "warn"
 expect_used = "allow"
-
-[profile.dev.package."*"]
-opt-level = 3

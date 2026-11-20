@@ -278,7 +278,7 @@ fn check_digest(
         .ok_or_else(|| AuthenticateError::new("the Reference carries no DigestValue"))?;
     let claimed = codec::base64::decode(claimed.trim())
         .map_err(|_| AuthenticateError::new("the DigestValue is not base64"))?;
-    if digest.as_slice() != claimed.as_slice() {
+    if digest[..] != claimed[..] {
         return Err(AuthenticateError::new(
             "the assertion's digest does not match the signed DigestValue: it was altered, \
              or its canonical form is one this gate does not reproduce",
