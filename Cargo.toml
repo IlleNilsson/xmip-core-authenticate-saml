@@ -1,11 +1,11 @@
 [package]
 name = "xmip-core-authenticate-saml"
-version = "0.1.0"
-edition = "2024"
-license = "AGPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 repository = "https://github.com/IlleNilsson/xmip-core-authenticate-saml"
 description = "Authenticate by saml: verifies an assertion's signature and conditions against the IdP metadata."
-publish = false
+publish.workspace = true
 
 [lib]
 path = "src/lib.rs"
@@ -36,22 +36,5 @@ tls = { package = "xmip-core-library-tls", git = "https://github.com/IlleNilsson
 # release, draws from rand_core 0.6, the generation rand 0.8 is on.
 rand = "0.8"
 
-[lints.rust]
-# forbid, not deny: a module has no business writing unsafe. The one exception
-# in the estate is xmip-core-abi, which holds the extern "C" vtable over
-# include/xmip_module.h and lowers this to deny with a reason at the call site.
-unsafe_code = "forbid"
-
-[lints.clippy]
-# Warned, never denied. doc/governance/rust-style.md section 3: a function
-# length gate was tried in this estate's PowerShell and produced a sixteen-entry
-# waiver list while catching nothing. The number worth reading is branches, and
-# clippy prints both.
-too_many_lines = "warn"
-
-# The ones that catch real defects rather than taste.
-pedantic = { level = "warn", priority = -1 }
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-unwrap_used = "warn"
-expect_used = "allow"
+[lints]
+workspace = true
